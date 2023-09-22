@@ -66,6 +66,7 @@ class GRABDataSet(object):
             self.splits = cfg.splits
             
         self.all_seqs = glob.glob(self.grab_path + '/*/*.npz')
+        self.rhand_smpl_to_mano = np.load(os.path.join(self.grab_path, '../tools/smplx_correspondence/rhand_smplx_ids.npy'))
         
         ## to be filled 
         self.selected_seqs = []
@@ -105,17 +106,11 @@ class GRABDataSet(object):
             self.logger('Processing data for %s split.' % (split))
 
             frame_names = []
-            body_data = {
-                'global_orient': [],'body_pose': [],'transl': [],
-                'right_hand_pose': [],'left_hand_pose': [],
-                'jaw_pose': [],'leye_pose': [],'reye_pose': [],
-                'expression': [],'fullpose': [],
-                'contact':[], 'verts' :[]
-            }
-
+            
             object_data ={'verts': [], 'global_orient': [], 'transl': [], 'contact': []}
-            lhand_data = {'verts': [], 'global_orient': [], 'hand_pose': [], 'transl': [], 'fullpose': []}
-            rhand_data = {'verts': [], 'global_orient': [], 'hand_pose': [], 'transl': [], 'fullpose': []}
+            rhand_data = {'verts': [], 'global_orient': [], 'hand_pose': [], 'transl': [], 'fullpose': [], 'contact': []}
+            next_frame_data = {'global_orient': [], 'hand_pose': [], 'transl': [], 'fullpose': []}
+            
 
             for sequence in tqdm(self.split_seqs[split]):
 
@@ -127,54 +122,27 @@ class GRABDataSet(object):
                 gender   = seq_data.gender
 
                 frame_mask = self.filter_contact_frames(seq_data)
+                indices = np.where(frame_mask)[0]
+                moved_indices = indices + 1
+                next_frame_mask = np.full(frame_mask.size, False)
+                next_frame_mask[moved_indices] = True
 
                 # total selectd frames
                 T = frame_mask.sum()
                 if T < 1:
                     continue # if no frame is selected continue to the next sequence
 
-                sbj_params = prepare_params(seq_data.body.params, frame_mask)
-                rh_params  = prepare_params(seq_data.rhand.params, frame_mask)
-                lh_params  = prepare_params(seq_data.lhand.params, frame_mask)
                 obj_params = prepare_params(seq_data.object.params, frame_mask)
 
-                append2dict(body_data, sbj_params)
-                append2dict(rhand_data, rh_params)
-                append2dict(lhand_data, lh_params)
                 append2dict(object_data, obj_params)
 
-                sbj_vtemp = self.load_sbj_verts(sbj_id, seq_data)
-
-                if cfg.save_body_verts:
-
-                    sbj_m = smplx.create(model_path=cfg.model_path,
-                                         model_type='smplx',
-                                         gender=gender,
-                                         num_pca_comps=n_comps,
-                                         v_template=sbj_vtemp,
-                                         batch_size=T)
-
-                    sbj_parms = params2torch(sbj_params)
-                    verts_sbj = to_cpu(sbj_m(**sbj_parms).vertices)
-                    body_data['verts'].append(verts_sbj)
-
-                if cfg.save_lhand_verts:
-                    lh_mesh = os.path.join(grab_path, '..', seq_data.lhand.vtemp)
-                    lh_vtemp = np.array(Mesh(filename=lh_mesh).vertices)
-
-                    lh_m = smplx.create(model_path=cfg.model_path,
-                                        model_type='mano',
-                                        is_rhand=False,
-                                        v_template=lh_vtemp,
-                                        num_pca_comps=n_comps,
-                                        flat_hand_mean=True,
-                                        batch_size=T)
-
-                    lh_parms = params2torch(lh_params)
-                    verts_lh = to_cpu(lh_m(**lh_parms).vertices)
-                    lhand_data['verts'].append(verts_lh)
-
-                if cfg.save_rhand_verts:
+                # save_rhand_verts
+                rh_params  = prepare_params(seq_data.rhand.params, frame_mask)
+                next_frame_rh_params = prepare_params(seq_data.rhand.params, next_frame_mask)
+                append2dict(rhand_data, rh_params)
+                append2dict(next_frame_data, next_frame_rh_params)
+                
+                if self.cfg['save_rhand_verts']:
                     rh_mesh = os.path.join(grab_path, '..', seq_data.rhand.vtemp)
                     rh_vtemp = np.array(Mesh(filename=rh_mesh).vertices)
 
@@ -185,7 +153,6 @@ class GRABDataSet(object):
                                         num_pca_comps=n_comps,
                                         flat_hand_mean=True,
                                         batch_size=T)
-
                     rh_parms = params2torch(rh_params)
                     verts_rh = to_cpu(rh_m(**rh_parms).vertices)
                     rhand_data['verts'].append(verts_rh)
@@ -203,8 +170,7 @@ class GRABDataSet(object):
                     object_data['verts'].append(verts_obj)
 
                 if cfg.save_contact:
-
-                    body_data['contact'].append(seq_data.contact.body[frame_mask])
+                    rhand_data['contact'].append(seq_data.contact.body[frame_mask][:, self.rhand_smpl_to_mano])
                     object_data['contact'].append(seq_data.contact.object[frame_mask][:,obj_info['verts_sample_id']])
 
                 frame_names.extend(['%s_%s' % (sequence.split('.')[0], fId) for fId in np.arange(T)])
@@ -214,8 +180,8 @@ class GRABDataSet(object):
             self.logger('Total number of frames for %s split is:%d' % (split, len(frame_names)))
 
 
-            out_data = [body_data, rhand_data, lhand_data, object_data]
-            out_data_name = ['body_data', 'rhand_data', 'lhand_data', 'object_data']
+            out_data = [rhand_data, next_frame_data, object_data]
+            out_data_name = ['rhand_data', 'next_frame_data', 'object_data']
 
             for idx, data in enumerate(out_data):
                 data = np2torch(data)
@@ -242,6 +208,8 @@ class GRABDataSet(object):
                 continue
             elif self.intent not in action_name:
                 continue
+            
+            # print(self.intent)
 
             # group motion sequences based on objects
             if object_name not in self.obj_based_seqs:
@@ -268,7 +236,10 @@ class GRABDataSet(object):
 
     def filter_contact_frames(self, seq_data):
         if self.cfg.only_contact:
-            frame_mask = (seq_data['contact']['object']>0).any(axis=1)
+            # frame_mask = (seq_data['contact']['object']>0).any(axis=1)
+            
+            #only save contact with rhand
+            frame_mask = (seq_data['contact']['object'] > 40).any(axis=1)
         else:
             frame_mask = (seq_data['contact']['object']>-1).any(axis=1)
         return frame_mask
@@ -366,7 +337,7 @@ if __name__ == '__main__':
         'only_contact':True, # if True, returns only frames with contact
         'save_body_verts': False, # if True, will compute and save the body vertices
         'save_lhand_verts': False, # if True, will compute and save the body vertices
-        'save_rhand_verts': False, # if True, will compute and save the body vertices
+        'save_rhand_verts': True, # if True, will compute and save the body vertices
         'save_object_verts': False,
 
         'save_contact': True, # if True, will add the contact info to the saved data
